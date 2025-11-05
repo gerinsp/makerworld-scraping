@@ -28,7 +28,12 @@ source venv/bin/activate
 pip install -r requirements.txt
 ```
 
-### 5. Install Chromium
+### 5. Install ffmpeg
+```bash
+brew install ffmpeg
+```
+
+### 6. Install Chromium
 ```bash
 python -m playwright install chromium
 ```
@@ -37,14 +42,17 @@ python -m playwright install chromium
 
 ```bash
 python3 app.py \
-  -k "cable winder" \
+  -k "Mechanical Artillery moving turret + recoil shoot" \
   -m 1 \
   --template "Shopee_mass_upload_2025-10-18_100644.xlsx" \
-  -o shopee_ready.xlsx \
-  --category-id 120039 \
+  -o output/shopee_ready.xlsx \
+  --category-id 101967 \
   --brand "No Brand" \
   --price 45000 \
   --stock 20 \
   --weight-kg 0.2 \
   --dims 12,12,4 \
-  --sku-prefix MW-CABLE-WINDER
+  --sku-prefix MW-CABLE-WINDER \
+  --meta-out output/makerworld_meta.csv \
+  --download-dir output/downloads \
+  --allow-gif

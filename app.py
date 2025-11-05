@@ -3,10 +3,16 @@ from urllib.parse import quote_plus, urljoin
 from pathlib import Path
 from playwright.sync_api import sync_playwright
 from openpyxl import load_workbook, Workbook
+import csv, io, subprocess, tempfile, requests
+from PIL import Image
+from urllib.parse import urlsplit, urlunsplit
+import os
 
 # =========================
 # Config / constants
 # =========================
+
+ALLOW_GIF = False
 
 PROFILE_DIR = ".mw_profile"
 STATE_FILE  = "makerworld_state.json"
@@ -30,6 +36,12 @@ STEALTH_JS = r"""() => {
 # =========================
 # Helpers: text & SEO
 # =========================
+
+def _prefer_raw_gif(u: str) -> str:
+    sp = urlsplit(u)
+    if ".gif" in sp.path.lower():
+        return urlunsplit((sp.scheme, sp.netloc, sp.path, "", ""))
+    return u
 
 def _norm_text(s: str) -> str:
     s = str(s or "")
@@ -77,9 +89,7 @@ def seo_desc(desc:str)->str:
         "Kegunaan: penggulung kabel USB/Type-C/Lightning.",
         "Material: PLA/ABS (sesuai profil cetak)."
     ]
-    # no profiles, no 'Sumber desain'
     final = "\n\n".join([p for p in parts if p]).strip()
-    # Safety cap
     return final[:3000]
 
 def auto_scroll(page):
@@ -108,7 +118,10 @@ def get_gallery_urls(page)->list[str]:
             low=u.lower()
             if any(b in low for b in ["avatar","logo","icon","/comment","emote","placeholder",".svg",".ico"]): 
                 continue
-            if not any(ext in low for ext in [".jpg",".jpeg",".png",".webp",".avif"]): 
+            exts = [".jpg",".jpeg",".png",".webp",".avif"]
+            if ALLOW_GIF:
+                exts.append(".gif")
+            if not any(ext in low for ext in exts):
                 continue
             if u not in urls: urls.append(u)
             if len(urls)==8: break
@@ -135,6 +148,7 @@ HEADER_ALIASES = {
     "Panjang Paket (cm)": {"panjang paket cm", "panjang cm", "panjang", "length", "length cm"},
     "Lebar Paket (cm)": {"lebar paket cm", "lebar cm", "lebar", "width", "width cm"},
     "Tinggi Paket (cm)": {"tinggi paket cm", "tinggi cm", "tinggi", "height", "height cm"},
+    "Masa Garansi": {"masa garansi", "garansi", "warranty period", "warranty", "warranty duration"},
 }
 
 def sanitize_xlsx(src_path:str)->str:
@@ -157,7 +171,7 @@ def create_minimal_template(path:str):
     ws.append(["Kategori","Nama Produk","Deskripsi Produk",
                "Harga","Stok","SKU Induk",
                "Berat (gram)","Panjang Paket (cm)","Lebar Paket (cm)","Tinggi Paket (cm)",
-               "Foto Produk"])
+               "Foto Produk", "Masa Garansi"])
     wb.save(path)
     return path
 
@@ -221,12 +235,12 @@ def write_rows_to_shopee_template(template_path:str, out_path:str, rows:list[dic
         ws.append(["Kategori","Nama Produk","Deskripsi Produk",
                    "Harga","Stok","SKU Induk",
                    "Berat (gram)","Panjang Paket (cm)","Lebar Paket (cm)","Tinggi Paket (cm)",
-                   "Foto Produk"])
+                   "Foto Produk", "Masa Garansi"])
         hdr_row = 1
         colmap_found = {h: i+1 for i, h in enumerate(["Kategori","Nama Produk","Deskripsi Produk",
                                                       "Harga","Stok","SKU Induk",
                                                       "Berat (gram)","Panjang Paket (cm)","Lebar Paket (cm)","Tinggi Paket (cm)",
-                                                      "Foto Produk"])}
+                                                      "Foto Produk", "Masa Garansi"])}
         image_cols = []
 
     def ensure_col(label):
@@ -239,7 +253,7 @@ def write_rows_to_shopee_template(template_path:str, out_path:str, rows:list[dic
 
     for req in ["Kategori","Nama Produk","Deskripsi Produk"]:
         ensure_col(req)
-    for maybe in ["Harga","Stok","SKU Induk","Berat (gram)","Panjang Paket (cm)","Lebar Paket (cm)","Tinggi Paket (cm)","Foto Produk"]:
+    for maybe in ["Harga","Stok","SKU Induk","Berat (gram)","Panjang Paket (cm)","Lebar Paket (cm)","Tinggi Paket (cm)","Foto Produk", "Masa Garansi"]:
         ensure_col(maybe)
 
     img_cols=[]
@@ -289,6 +303,13 @@ def write_rows_to_shopee_template(template_path:str, out_path:str, rows:list[dic
             if "Foto Produk" in colmap_found:
                 ws.cell(r, C("Foto Produk")).value = ",".join(urls)
 
+        warranty_text = (row.get("warranty") or "No Warranty")
+        if "Masa Garansi" in colmap_found:
+            ws.cell(r, C("Masa Garansi")).value = warranty_text
+        else:
+            ensure_col("Masa Garansi")
+            ws.cell(r, C("Masa Garansi")).value = warranty_text
+
         r += 1
 
     wb.save(out_path)
@@ -327,7 +348,6 @@ def scrape(keyword:str, max_results:int, headless:bool, proxy:str|None):
                         try: ctx.storage_state(path=STATE_FILE)
                         except: pass
                         ctx.close()
-                        # retry sekali non-headless
                         return scrape(keyword, max_results, headless=False, proxy=proxy)
                     time.sleep(8)
 
@@ -382,12 +402,111 @@ def scrape(keyword:str, max_results:int, headless:bool, proxy:str|None):
                 except: pass
     return results
 
+
+# =========================
+# GIF / Video helpers + Metadata writer
+# =========================
+def _ensure_dir(p: str):
+    Path(p).parent.mkdir(parents=True, exist_ok=True)
+
+def gif_to_mp4_bytes(gif_bytes: bytes):
+    """Convert GIF -> MP4; fallback ambil first frame JPG.
+       Memastikan dimensi genap agar kompatibel yuv420p/libx264."""
+    import tempfile, subprocess, io
+    from pathlib import Path
+    from PIL import Image
+
+    with tempfile.TemporaryDirectory() as td:
+        gif_path = Path(td) / "in.gif"
+        mp4_path = Path(td) / "out.mp4"
+        gif_path.write_bytes(gif_bytes)
+
+        mp4_bytes = None
+        vf = "fps=24,scale=trunc(iw/2)*2:trunc(ih/2)*2"
+        cmd = [
+            "ffmpeg", "-y",
+            "-i", str(gif_path),
+            "-movflags", "faststart",
+            "-pix_fmt", "yuv420p",
+            "-c:v", "libx264",
+            "-vf", vf,
+            str(mp4_path),
+        ]
+        try:
+            p = subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            if mp4_path.exists() and mp4_path.stat().st_size > 0:
+                mp4_bytes = mp4_path.read_bytes()
+        except Exception as e:
+            try:
+                print("[ffmpeg] convert failed:", e)
+                p = subprocess.run(cmd, capture_output=True, text=True)
+                print("[ffmpeg] stderr:", (p.stderr or "")[:1000])
+            except Exception:
+                pass
+
+        jpg_bytes = None
+        try:
+            im = Image.open(io.BytesIO(gif_bytes))
+            im.seek(0)
+            rgb = im.convert("RGB")
+            buf = io.BytesIO()
+            rgb.save(buf, format="JPEG", quality=90)
+            jpg_bytes = buf.getvalue()
+        except Exception:
+            pass
+
+    return mp4_bytes, jpg_bytes
+
+def handle_gif_url(url: str, save_dir="downloads"):
+    """Download GIF & convert; return dict path hasil."""
+    try:
+        r = requests.get(url, timeout=30)
+        r.raise_for_status()
+        gif_bytes = r.content
+    except Exception:
+        return {"gif_path": None, "mp4_path": None, "jpg_path": None}
+
+    _ensure_dir(save_dir + "/x")
+    base = re.sub(r'[^A-Za-z0-9_-]+', '_', Path(url).stem)[:60] or "gif"
+    gif_path = f"{save_dir}/{base}.gif"
+    Path(gif_path).write_bytes(gif_bytes)
+
+    mp4_bytes, jpg_bytes = gif_to_mp4_bytes(gif_bytes)
+    mp4_path = None
+    jpg_path = None
+    if mp4_bytes:
+        mp4_path = f"{save_dir}/{base}.mp4"
+        Path(mp4_path).write_bytes(mp4_bytes)
+    if jpg_bytes:
+        jpg_path = f"{save_dir}/{base}.jpg"
+        Path(jpg_path).write_bytes(jpg_bytes)
+
+    return {"gif_path": gif_path, "mp4_path": mp4_path, "jpg_path": jpg_path}
+
+def write_metadata_csv(path_csv: str, items: list[dict]):
+    Path(path_csv).parent.mkdir(parents=True, exist_ok=True)
+    with open(path_csv, "w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(["SKU","Nama Produk","MakerWorld Link","Image URLs","Video MP4 (local)","GIF First Frame (local)"])
+        for it in items:
+            w.writerow([
+                it.get("sku",""),
+                it.get("title",""),
+                it.get("makerworld_url",""),
+                " | ".join(it.get("image_urls", [])),
+                it.get("video_path","") or "",
+                it.get("gif_first_frame","") or "",
+            ])
+    print(f"✅ Metadata CSV tersimpan: {path_csv}")
+
 # =========================
 # Main
 # =========================
 
 def main():
     ap=argparse.ArgumentParser()
+
+    global ALLOW_GIF
     ap.add_argument("-k","--keyword", required=True)
     ap.add_argument("-m","--max", type=int, default=1)
     ap.add_argument("--template", required=True)
@@ -402,7 +521,20 @@ def main():
     ap.add_argument("--proxy", default=None)
     ap.add_argument("--headless", action="store_true")
     ap.add_argument("--sheet", default=None, help="Nama sheet bila template punya banyak tab")
+    ap.add_argument("--warranty", default="Tidak bergaransi", help="Isi masa garansi jika tidak ada di template")
+
+    ap.add_argument("--meta-out", default="metadata.csv", help="Output metadata CSV")
+    ap.add_argument("--allow-gif", action="store_true", help="Aktifkan konversi GIF → MP4 (atau JPG frame pertama)")
+    ap.add_argument("--download-dir", default="downloads", help="Folder simpan hasil unduhan")
+
     args=ap.parse_args()
+
+    out_dir = os.path.dirname(args.out)
+    if out_dir and not os.path.exists(out_dir):
+        os.makedirs(out_dir, exist_ok=True)
+
+    global ALLOW_GIF
+    ALLOW_GIF = bool(args.allow_gif)
 
     dims=tuple(int(x) for x in args.dims.split(",")[:3])
 
@@ -413,6 +545,8 @@ def main():
         return
 
     rows=[]
+    metas=[]
+    
     for i, r in enumerate(recs, start=1):
         rows.append({
             "category_id": args.category_id,
@@ -426,7 +560,28 @@ def main():
             "sku": f"{args.sku_prefix}-{i:04d}",
         })
 
+        meta = {
+            "sku": f"{args.sku_prefix}-{i:04d}",
+            "title": seo_title(r["title"]),
+            "makerworld_url": r.get("url", ""),
+            "image_urls": r.get("image_urls", [])[:8],
+            "video_path": "",
+            "gif_first_frame": "",
+        }
+
+        if ALLOW_GIF:
+            for u in meta["image_urls"]:
+                u_try = _prefer_raw_gif(u)
+                paths = handle_gif_url(u_try, save_dir=args.download_dir)
+                if paths.get("mp4_path") or paths.get("jpg_path"):
+                    meta["video_path"] = paths.get("mp4_path") or ""
+                    meta["gif_first_frame"] = paths.get("jpg_path") or ""
+                    break
+
+        metas.append(meta)
+
     write_rows_to_shopee_template(args.template, args.out, rows, sheet_name=args.sheet)
+    write_metadata_csv(args.meta_out, metas)
     print("✅ Selesai.")
 
 if __name__ == "__main__":
