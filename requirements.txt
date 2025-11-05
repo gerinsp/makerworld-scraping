@@ -5,4 +5,5 @@ tqdm
 python-dotenv 
 requests
 pyxlsb
-pillowpython app_merged.py --help
+Pillow
+
