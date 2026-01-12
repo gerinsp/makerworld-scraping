@@ -1,0 +1,17 @@
+Produk ini adalah produk hasil scraping. Warna yang tertera pada gambar bisa jadi berbeda tergantung dengan kesediaan filament
+Kamu bisa request warna berikut dengan cara memberikan note ketika pemesanan:
+- Putih
+- Hitam
+- Hitam kebiruan (Onyx)
+- Merah
+- Orange
+- Biru Muda
+- Coklat
+- Abu-Abu
+- Hijau Tua
+
+Berikut adalah spec produk dari desainer produk:
+{scraping_description_result}
+
+Apabila ada cacat dan produk yang dibeli tidak sesuai ekspektasi, silahkan di retur sesuai dengan ketentuan Shopee.
+Terima kasih.

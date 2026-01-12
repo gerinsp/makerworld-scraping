@@ -41,11 +41,12 @@ python -m playwright install chromium
 ### Example Usage
 
 ```bash
-python3 app.py \
+python app.py \
   -k "Mechanical Artillery moving turret + recoil shoot" \
   -m 1 \
-  --template "Shopee_mass_upload_2025-10-18_100644.xlsx" \
+  --template "Shopee_mass_upload_2026-01-12_basic_template.xlsx" \
   -o output/shopee_ready.xlsx \
+  --desc-template desc_template.txt \
   --category-id 101967 \
   --brand "No Brand" \
   --price 45000 \

@@ -7,6 +7,7 @@ import csv, io, subprocess, tempfile, requests
 from PIL import Image
 from urllib.parse import urlsplit, urlunsplit
 import os
+import hashlib
 
 # =========================
 # Config / constants
@@ -16,6 +17,9 @@ ALLOW_GIF = False
 
 PROFILE_DIR = ".mw_profile"
 STATE_FILE  = "makerworld_state.json"
+
+MAX_SHOPEE_IMG_BYTES = 2_000_000   # 2 MB
+MAX_IMG_SIDE = 1200  
 
 STEALTH_JS = r"""() => {
   Object.defineProperty(navigator,'webdriver',{get:()=>undefined});
@@ -36,6 +40,85 @@ STEALTH_JS = r"""() => {
 # =========================
 # Helpers: text & SEO
 # =========================
+
+def shopee_safe_image_url(u: str) -> str:
+    if not u:
+        return ""
+    sp = urlsplit(u)
+    q = sp.query or ""
+    q = re.sub(r"(?i)/format,webp\b", "", q)
+    q = re.sub(r"(?i)(^|[&?])format=webp\b", r"\1format=png", q)
+    if not q or q == "x-oss-process=":
+        return urlunsplit((sp.scheme, sp.netloc, sp.path, "", ""))
+    return urlunsplit((sp.scheme, sp.netloc, sp.path, q, ""))
+
+def _shopee_safe_jpg_bytes(img: Image.Image, max_bytes=MAX_SHOPEE_IMG_BYTES) -> bytes:
+    img = img.convert("RGB")
+
+    for q in [92, 90, 88, 86, 84, 82, 80, 78, 76, 74, 72, 70, 68, 66, 64]:
+        buf = io.BytesIO()
+        img.save(buf, format="JPEG", quality=q, optimize=True, progressive=True)
+        b = buf.getvalue()
+        if len(b) <= max_bytes:
+            return b
+
+    buf = io.BytesIO()
+    img.save(buf, format="JPEG", quality=60, optimize=True, progressive=True)
+    return buf.getvalue()
+
+def download_convert_shopee_image(url: str, save_dir: str, sku: str, idx: int) -> str | None:
+    try:
+        r = requests.get(url, timeout=30)
+        r.raise_for_status()
+        img_bytes = r.content
+    except Exception as e:
+        print("[img] download failed:", url, e)
+        return None
+
+    try:
+        im = Image.open(io.BytesIO(img_bytes))
+
+        w, h = im.size
+        m = max(w, h)
+        if m > MAX_IMG_SIDE:
+            scale = MAX_IMG_SIDE / float(m)
+            new_w = max(1, int(round(w * scale)))
+            new_h = max(1, int(round(h * scale)))
+            im = im.resize((new_w, new_h), Image.LANCZOS)
+
+        jpg_bytes = _shopee_safe_jpg_bytes(im, MAX_SHOPEE_IMG_BYTES)
+
+        Path(save_dir).mkdir(parents=True, exist_ok=True)
+        filename = f"{sku}_{idx}.jpg"
+        out_path = str(Path(save_dir) / filename)
+        Path(out_path).write_bytes(jpg_bytes)
+
+        return out_path
+    except Exception as e:
+        print("[img] convert failed:", url, e)
+        return None
+
+def download_and_convert_image(url: str, save_dir: str) -> str | None:
+    try:
+        r = requests.get(url, timeout=30)
+        r.raise_for_status()
+        img_bytes = r.content
+    except Exception:
+        return None
+
+    try:
+        im = Image.open(io.BytesIO(img_bytes))
+        im = im.convert("RGB")
+
+        Path(save_dir).mkdir(parents=True, exist_ok=True)
+        base = re.sub(r'[^A-Za-z0-9_-]+', '_', Path(url).stem)[:60] or "img"
+        out_path = f"{save_dir}/{base}.jpg"
+
+        im.save(out_path, "JPEG", quality=90, subsampling=0)
+        return out_path
+    except Exception:
+        return None
+
 
 def _prefer_raw_gif(u: str) -> str:
     sp = urlsplit(u)
@@ -77,7 +160,28 @@ def _clean_desc_text(desc: str) -> str:
         if any(p.search(ln) for p in _REMOVE_LINE_PATTERNS):
             continue
         cleaned.append(ln)
-    return "\n".join(cleaned)
+    return strip_urls("\n".join(cleaned))
+
+def load_text_file(path: str | None) -> str | None:
+    if not path:
+        return None
+    p = Path(path)
+    if not p.exists():
+        print(f"[Template] desc template tidak ditemukan: {path}")
+        return None
+    return p.read_text(encoding="utf-8")
+
+def format_desc_with_template(scraped_desc: str, template_text: str | None) -> str:
+    scraped_clean = _clean_desc_text(scraped_desc)
+
+    if not template_text:
+        return seo_desc(scraped_desc)
+
+    out = template_text.replace("{scraping_description_result}", scraped_clean or "-")
+
+    out = out.replace("\r\n", "\n").replace("\r", "\n").strip()
+    out = strip_urls(out)
+    return out[:3000]
 
 def seo_desc(desc:str)->str:
     parts=[]
@@ -100,41 +204,68 @@ def auto_scroll(page):
 
 def get_gallery_urls(page)->list[str]:
     g=page.query_selector(".photo_show")
-    if not g: return []
-    for th in g.query_selector_all("img, .swiper-slide img, picture img"):
-        try:
-            th.scroll_into_view_if_needed()
-            th.click(timeout=150)
-            time.sleep(0.05)
-        except: 
-            pass
     urls=[]
-    for im in g.query_selector_all("img"):
+    if g:
+        for th in g.query_selector_all("img, .swiper-slide img, picture img"):
+            try:
+                th.scroll_into_view_if_needed()
+                th.click(timeout=150)
+                time.sleep(0.05)
+            except:
+                pass
+
+        for im in g.query_selector_all("img, picture img"):
+            try:
+                u = im.get_attribute("src") or im.get_attribute("data-src") or im.get_attribute("srcset")
+                if not u:
+                    continue
+                if "," in u:
+                    u = u.split(",")[-1].strip().split(" ")[0]
+                if u.startswith("//"):
+                    u = "https:" + u
+                if u.startswith("/"):
+                    u = urljoin("https://makerworld.com", u)
+                low=u.lower()
+                if any(b in low for b in ["avatar","logo","icon","/comment","emote","placeholder",".svg",".ico"]):
+                    continue
+                exts = [".jpg",".jpeg",".png",".webp",".avif"]
+                if ALLOW_GIF:
+                    exts.append(".gif")
+                path_low = urlsplit(u).path.lower()
+                if not any(path_low.endswith(ext) for ext in exts):
+                    continue
+                u2 = shopee_safe_image_url(u)
+                if u2 and u2 not in urls:
+                    urls.append(u2)
+                if len(urls)==8:
+                    break
+            except:
+                pass
+
+    if not urls:
         try:
-            u=im.get_attribute("src") or im.get_attribute("data-src")
-            if not u: continue
-            if u.startswith("//"): u="https:"+u
-            if u.startswith("/"):  u=urljoin("https://makerworld.com", u)
-            low=u.lower()
-            if any(b in low for b in ["avatar","logo","icon","/comment","emote","placeholder",".svg",".ico"]): 
-                continue
-            exts = [".jpg",".jpeg",".png",".webp",".avif"]
-            if ALLOW_GIF:
-                exts.append(".gif")
-            if not any(ext in low for ext in exts):
-                continue
-            if u not in urls: urls.append(u)
-            if len(urls)==8: break
-        except: 
+            og = page.query_selector("meta[property='og:image']")
+            if og:
+                u = (og.get_attribute("content") or "").strip()
+                if u:
+                    urls = [shopee_safe_image_url(u)]
+        except:
             pass
-    return urls
+
+    return urls[:8]
 
 # =========================
 # XLSX sanitizer & header mapping
 # =========================
 
 SHEETVIEWS_RE = re.compile(rb"<sheetViews[\s\S]*?</sheetViews>")
-IMG_LABEL_RE  = re.compile(r"^foto\s+(sampul|produk\s+\d+)$") 
+IMG_LABEL_RE = re.compile(
+    r"^(foto\s+(sampul|utama|produk\s+\d+)|cover\s*image|item\s*image\s*\d+)$",
+    re.I
+)
+URL_RE = re.compile(
+    r"(?i)\b(?:https?://|www\.)\S+|\b\S+\.(?:com|net|org|id|io|co|me|xyz|gg|ly|ai|app|site|store|shop|link|pdf|zip)\b\S*"
+)
 
 HEADER_ALIASES = {
     "Kategori": {"kategori", "category", "product category", "category id"},
@@ -150,6 +281,14 @@ HEADER_ALIASES = {
     "Tinggi Paket (cm)": {"tinggi paket cm", "tinggi cm", "tinggi", "height", "height cm"},
     "Masa Garansi": {"masa garansi", "garansi", "warranty period", "warranty", "warranty duration"},
 }
+
+def strip_urls(text: str) -> str:
+    if not text:
+        return ""
+    text = URL_RE.sub("", text)
+    text = re.sub(r"[ \t]+", " ", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
 
 def sanitize_xlsx(src_path:str)->str:
     src = Path(src_path)
@@ -262,6 +401,17 @@ def write_rows_to_shopee_template(template_path:str, out_path:str, rows:list[dic
         if IMG_LABEL_RE.match(lab):
             img_cols.append(c)
     img_cols = sorted(img_cols)
+
+    def _img_rank(c):
+        t = _norm_text(ws.cell(hdr_row, c).value)
+        if t in ("cover image", "foto sampul", "foto utama"):
+            return (0, 0, c)
+        m = re.search(r"(?:item image|foto produk)\s*(\d+)$", t)
+        if m:
+            return (1, int(m.group(1)), c)
+        return (2, 999, c)
+
+    img_cols = sorted(img_cols, key=_img_rank)
 
     def row_has_data(rr):
         for c in range(1, ws.max_column+1):
@@ -527,7 +677,11 @@ def main():
     ap.add_argument("--allow-gif", action="store_true", help="Aktifkan konversi GIF → MP4 (atau JPG frame pertama)")
     ap.add_argument("--download-dir", default="downloads", help="Folder simpan hasil unduhan")
 
+    ap.add_argument("--desc-template", default=None, help="Path .txt template deskripsi, gunakan placeholder {scraping_description_result}")
+
     args=ap.parse_args()
+
+    desc_template_text = load_text_file(args.desc_template)
 
     out_dir = os.path.dirname(args.out)
     if out_dir and not os.path.exists(out_dir):
@@ -548,20 +702,35 @@ def main():
     metas=[]
     
     for i, r in enumerate(recs, start=1):
+        desc_final = format_desc_with_template(r["description"], desc_template_text)
+
+        sku = f"{args.sku_prefix}-{i:04d}"
+
+        urls_public = []
+        for u in r.get("image_urls", [])[:8]:
+            u2 = shopee_safe_image_url(u)
+            if u2:
+                urls_public.append(u2)
+        urls_public = urls_public[:8]
+
+        if not urls_public:
+            print(f"[!] Gagal ambil gambar untuk SKU {sku}. Shopee butuh Cover image. Skip item ini.")
+            continue
+
         rows.append({
             "category_id": args.category_id,
             "name": seo_title(r["title"]),
-            "description": seo_desc(r["description"]),
-            "image_urls": r.get("image_urls", [])[:8],
+            "description": desc_final,
+            "image_urls": urls_public,
             "price": args.price,
             "stock": args.stock,
             "weight_kg": args.weight_kg,
             "dims_cm": dims,
-            "sku": f"{args.sku_prefix}-{i:04d}",
+            "sku": sku,
         })
 
         meta = {
-            "sku": f"{args.sku_prefix}-{i:04d}",
+            "sku": sku,
             "title": seo_title(r["title"]),
             "makerworld_url": r.get("url", ""),
             "image_urls": r.get("image_urls", [])[:8],
